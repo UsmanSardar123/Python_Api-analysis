@@ -20,14 +20,17 @@ from app.schemas import (
 from app.services.analysis_service import AnalysisService
 from app.services.competitor_service import CompetitorService
 from app.services.llm_service import (
+    LLMAuthenticationError,
     LLMConfigurationError,
     LLMService,
     LLMServiceError,
+    redact_secrets,
 )
 from app.services.website_extractor import (
     WebsiteExtractionError,
     WebsiteExtractorService,
 )
+from app.utils.rate_limiter import rate_limiter
 from app.utils.validators import (
     SSRFProtectionError,
     URLValidationError,
@@ -688,6 +691,106 @@ class TestLLMServiceAndValidation:
             assert model == test_settings.openai_model
             assert payload.competitor_analysis.brand_name == "CloudPulse Analytics"
 
+    def test_provider_selection_gemini_primary_vs_openai_primary(self) -> None:
+        """Verify _resolve_provider_order selects configured primary provider and respects fallback settings."""
+        gemini_primary = Settings(
+            llm_provider="gemini",
+            gemini_api_key="AIzaSyTestKey12345678901234567890",
+            gemini_model="gemini-2.5-flash",
+            openai_api_key="sk-testopenai123456789012345",
+            openai_model="gpt-4o-mini",
+            enable_llm_fallback=True,
+        )
+        candidates = LLMService(settings=gemini_primary)._resolve_provider_order()
+        assert len(candidates) == 2
+        assert candidates[0][0] == "gemini"
+        assert candidates[0][1] == "gemini-2.5-flash"
+        assert candidates[1][0] == "openai"
+        assert candidates[1][1] == "gpt-4o-mini"
+
+        openai_primary_no_fallback = Settings(
+            llm_provider="openai",
+            gemini_api_key="AIzaSyTestKey12345678901234567890",
+            openai_api_key="sk-testopenai123456789012345",
+            enable_llm_fallback=False,
+        )
+        candidates_oa = LLMService(settings=openai_primary_no_fallback)._resolve_provider_order()
+        assert len(candidates_oa) == 1
+        assert candidates_oa[0][0] == "openai"
+
+    def test_llm_fallback_from_openai_to_gemini(self) -> None:
+        """If OpenAI is primary and fails, LLMService falls back to Gemini when enabled."""
+        import asyncio
+
+        test_settings = Settings(
+            llm_provider="openai",
+            gemini_api_key="AIzaSyTestKey12345678901234567890",
+            openai_api_key="sk-testopenai123456789012345",
+            enable_llm_fallback=True,
+        )
+        llm_service = LLMService(settings=test_settings)
+        extractor = WebsiteExtractorService(settings=test_settings)
+        extracted = extractor.parse_html(SAMPLE_HTML, "https://example.com", "https://example.com")
+
+        with (
+            patch.object(
+                llm_service,
+                "_call_openai",
+                side_effect=LLMServiceError("OpenAI 503 overloaded"),
+            ),
+            patch.object(
+                llm_service,
+                "_call_gemini",
+                return_value=json.dumps(get_valid_mock_llm_dict()),
+            ),
+        ):
+            payload, provider, model = asyncio.run(
+                llm_service.generate_structured_analysis(extracted, {})
+            )
+            assert provider == "gemini"
+            assert model == test_settings.gemini_model
+
+    def test_invalid_api_key_raises_authentication_error_and_redacts_secrets(self) -> None:
+        """Invalid API key errors must raise LLMAuthenticationError and redact raw keys from error strings."""
+        import asyncio
+
+        secret_gemini_key = "AIzaSySecretKeyValue123456789012345"
+        test_settings = Settings(
+            llm_provider="gemini",
+            gemini_api_key=secret_gemini_key,
+            openai_api_key="",
+            enable_llm_fallback=False,
+        )
+        llm_service = LLMService(settings=test_settings)
+        extractor = WebsiteExtractorService(settings=test_settings)
+        extracted = extractor.parse_html(SAMPLE_HTML, "https://example.com", "https://example.com")
+
+        with patch.object(
+            llm_service,
+            "_call_gemini",
+            side_effect=LLMAuthenticationError(
+                redact_secrets(f"400 API_KEY_INVALID: key={secret_gemini_key} not valid")
+            ),
+        ):
+            with pytest.raises(LLMAuthenticationError) as exc_info:
+                asyncio.run(llm_service.generate_structured_analysis(extracted, {}))
+            assert secret_gemini_key not in str(exc_info.value)
+            assert "[REDACTED" in str(exc_info.value)
+
+    def test_secret_redaction_utility(self) -> None:
+        """Verify redact_secrets strips Gemini keys, OpenAI sk- keys, query keys, and Bearer tokens."""
+        raw = (
+            "Error with AIzaSyB12345678901234567890abcd and sk-proj-12345678901234567890 "
+            "at https://api.example.com?key=mysecret123 Authorization: Bearer tok_987654"
+        )
+        cleaned = redact_secrets(raw)
+        assert "AIzaSyB12345678901234567890abcd" not in cleaned
+        assert "sk-proj-12345678901234567890" not in cleaned
+        assert "mysecret123" not in cleaned
+        assert "tok_987654" not in cleaned
+        assert "[REDACTED_GEMINI_KEY]" in cleaned
+        assert "[REDACTED_OPENAI_KEY]" in cleaned
+
 
 # =============================================================================
 # 4. FastAPI Endpoint Integration Tests (POST /link-analysis)
@@ -699,9 +802,11 @@ class TestFastAPIEndpoints:
 
     def setup_method(self) -> None:
         app.dependency_overrides.clear()
+        rate_limiter.reset()
 
     def teardown_method(self) -> None:
         app.dependency_overrides.clear()
+        rate_limiter.reset()
 
     def test_health_and_docs_endpoints(self) -> None:
         """GET /health and GET /docs should be accessible and return HTTP 200."""
@@ -867,3 +972,178 @@ class TestFastAPIEndpoints:
         response = client.post("/link-analysis", json={"url": "https://example.com"})
         assert response.status_code == 502
         assert response.json()["detail"]["error"] == "llm_generation_failed"
+
+    def test_post_link_analysis_invalid_api_key_returns_401(self) -> None:
+        """POST /link-analysis when LLM API key is rejected returns HTTP 401 without exposing the key."""
+        extractor = WebsiteExtractorService()
+        extracted_data = extractor.parse_html(
+            SAMPLE_HTML, "https://example.com", "https://example.com"
+        )
+
+        mock_extractor = MagicMock(spec=WebsiteExtractorService)
+        mock_extractor.extract_from_url = AsyncMock(return_value=extracted_data)
+
+        mock_llm = MagicMock(spec=LLMService)
+        mock_llm.generate_structured_analysis = AsyncMock(
+            side_effect=LLMAuthenticationError(
+                "Invalid API key AIzaSySecretKey12345678901234567890"
+            )
+        )
+
+        service = AnalysisService(
+            extractor_service=mock_extractor,
+            llm_service=mock_llm,
+        )
+        app.dependency_overrides[get_analysis_service] = lambda: service
+
+        client = TestClient(app)
+        response = client.post("/link-analysis", json={"url": "https://example.com"})
+        assert response.status_code == 401
+        detail = response.json()["detail"]
+        assert detail["error"] == "invalid_api_key"
+        assert "AIzaSySecretKey12345678901234567890" not in detail["message"]
+        assert "[REDACTED_GEMINI_KEY]" in detail["message"]
+
+    def test_post_link_analysis_rate_limiting_returns_429(self) -> None:
+        """Exceeding configured rate_limit_requests_per_minute returns HTTP 429 Too Many Requests."""
+        strict_settings = Settings(
+            rate_limit_requests_per_minute=2,
+            rate_limit_window_seconds=60,
+        )
+        app.dependency_overrides[get_settings] = lambda: strict_settings
+
+        extractor = WebsiteExtractorService(settings=strict_settings)
+        extracted_data = extractor.parse_html(
+            SAMPLE_HTML, "https://example.com", "https://example.com"
+        )
+        mock_extractor = MagicMock(spec=WebsiteExtractorService)
+        mock_extractor.extract_from_url = AsyncMock(return_value=extracted_data)
+        mock_llm = MagicMock(spec=LLMService)
+        mock_llm.generate_structured_analysis = AsyncMock(
+            return_value=(
+                LLMAnalysisPayload.model_validate(get_valid_mock_llm_dict()),
+                "gemini",
+                "gemini-2.5-flash",
+            )
+        )
+        service = AnalysisService(
+            settings=strict_settings,
+            extractor_service=mock_extractor,
+            llm_service=mock_llm,
+        )
+        app.dependency_overrides[get_analysis_service] = lambda: service
+
+        client = TestClient(app)
+        r1 = client.post("/link-analysis", json={"url": "https://example.com"})
+        r2 = client.post("/link-analysis", json={"url": "https://example.com"})
+        r3 = client.post("/link-analysis", json={"url": "https://example.com"})
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r3.status_code == 429
+        assert r3.json()["detail"]["error"] == "rate_limit_exceeded"
+        assert "Retry-After" in r3.headers
+
+    def test_demo_mode_is_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Production safety: Settings.enable_demo_mode_without_api_key must default to False."""
+        monkeypatch.delenv("ENABLE_DEMO_MODE_WITHOUT_API_KEY", raising=False)
+        default_settings = Settings()
+        assert default_settings.enable_demo_mode_without_api_key is False
+        assert default_settings.llm_provider == "gemini"
+        assert default_settings.gemini_model == "gemini-2.5-flash"
+
+    def test_oversized_response_rejected_with_413(self) -> None:
+        """If target website returns Content-Length exceeding max_response_bytes, return HTTP 413."""
+        import asyncio
+
+        small_limit_settings = Settings(max_response_bytes=65_536)
+        extractor = WebsiteExtractorService(settings=small_limit_settings)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {
+            "content-type": "text/html",
+            "content-length": str(5_000_000),
+        }
+
+        mock_stream_ctx = AsyncMock()
+        mock_stream_ctx.__aenter__.return_value = mock_response
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+
+        mock_client_ctx = AsyncMock()
+        mock_client_ctx.__aenter__.return_value = mock_client
+
+        with (
+            patch(
+                "app.utils.validators.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 443))],
+            ),
+            patch("httpx.AsyncClient", return_value=mock_client_ctx),
+        ):
+            with pytest.raises(WebsiteExtractionError) as exc_info:
+                asyncio.run(extractor.extract_from_url("https://large.example.com"))
+            assert exc_info.value.status_code == 413
+
+    def test_gemini_transient_rate_limit_retries_and_succeeds(self) -> None:
+        """Verify _call_gemini retries on transient 429 RESOURCE_EXHAUSTED errors before succeeding."""
+        import asyncio
+
+        retry_settings = Settings(
+            llm_provider="gemini",
+            gemini_api_key="AIzaSyTestKey12345678901234567890",
+            llm_max_retries=2,
+            llm_timeout_seconds=10.0,
+        )
+        llm_service = LLMService(settings=retry_settings)
+
+        mock_response = MagicMock()
+        mock_response.text = json.dumps(get_valid_mock_llm_dict())
+
+        mock_generate = AsyncMock(
+            side_effect=[
+                RuntimeError("429 RESOURCE_EXHAUSTED: Quota exceeded"),
+                mock_response,
+            ]
+        )
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = mock_generate
+
+        with patch("google.genai.Client", return_value=mock_client):
+            result_text = asyncio.run(
+                llm_service._call_gemini(
+                    api_key="AIzaSyTestKey12345678901234567890",
+                    model="gemini-2.5-flash",
+                    system_prompt="sys",
+                    user_prompt="usr",
+                )
+            )
+            assert "CloudPulse Analytics" in result_text
+            assert mock_generate.call_count == 2
+
+    def test_malformed_request_body_returns_422(self) -> None:
+        """POST /link-analysis with missing 'url' field or empty body returns HTTP 422."""
+        client = TestClient(app)
+        resp_missing = client.post("/link-analysis", json={})
+        assert resp_missing.status_code == 422
+
+        resp_empty_str = client.post("/link-analysis", json={"url": "   "})
+        assert resp_empty_str.status_code == 422
+
+    def test_health_endpoint_does_not_expose_raw_api_keys(self) -> None:
+        """GET /health must only return boolean key flags, never raw API key strings."""
+        secret_settings = Settings(
+            gemini_api_key="AIzaSySuperSecretKeyDoNotExpose12345",
+            openai_api_key="sk-proj-SuperSecretOpenAIKeyDoNotExpose",
+        )
+        app.dependency_overrides[get_settings] = lambda: secret_settings
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        body_text = resp.text
+        assert "AIzaSySuperSecretKeyDoNotExpose12345" not in body_text
+        assert "sk-proj-SuperSecretOpenAIKeyDoNotExpose" not in body_text
+        assert resp.json()["gemini_key_configured"] is True
+        assert resp.json()["openai_key_configured"] is True

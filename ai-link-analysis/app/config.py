@@ -31,10 +31,29 @@ class Settings(BaseSettings):
         description="Public name of the FastAPI service.",
     )
     app_version: str = Field(default="1.0.0", description="API semantic version.")
-    app_env: str = Field(default="development", validation_alias="APP_ENV")
+    app_env: str = Field(default="production", validation_alias="APP_ENV")
     host: str = Field(default="0.0.0.0", validation_alias="HOST")
     port: int = Field(default=8000, validation_alias="PORT")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+    cors_origins: str = Field(
+        default="*",
+        validation_alias="CORS_ORIGINS",
+        description="Comma-separated list of allowed CORS origins.",
+    )
+    llm_timeout_seconds: float = Field(
+        default=45.0,
+        validation_alias="LLM_TIMEOUT_SECONDS",
+        ge=5.0,
+        le=180.0,
+        description="Maximum timeout in seconds for upstream LLM API calls.",
+    )
+    llm_max_retries: int = Field(
+        default=2,
+        validation_alias="LLM_MAX_RETRIES",
+        ge=0,
+        le=5,
+        description="Number of automatic retries for transient LLM rate-limit or network errors.",
+    )
 
     # LLM Provider Configuration
     llm_provider: Literal["gemini", "openai"] = Field(
@@ -74,6 +93,22 @@ class Settings(BaseSettings):
             "When true and no LLM API keys are configured, generates a deterministic "
             "rule-based structured analysis from extracted website facts for local testing."
         ),
+    )
+
+    # Rate Limiting & Abuse Protection
+    rate_limit_requests_per_minute: int = Field(
+        default=20,
+        validation_alias="RATE_LIMIT_REQUESTS_PER_MINUTE",
+        ge=1,
+        le=1000,
+        description="Maximum allowed POST /link-analysis requests per client IP per 60-second window.",
+    )
+    rate_limit_window_seconds: int = Field(
+        default=60,
+        validation_alias="RATE_LIMIT_WINDOW_SECONDS",
+        ge=1,
+        le=3600,
+        description="Sliding window duration in seconds for IP rate limiting.",
     )
 
     # Website Extraction & Security Limits

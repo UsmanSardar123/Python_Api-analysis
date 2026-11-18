@@ -8,8 +8,14 @@ from fastapi.responses import JSONResponse
 from app.config import Settings, get_settings
 from app.schemas import LinkAnalysisRequest, LinkAnalysisResponse
 from app.services.analysis_service import AnalysisService
-from app.services.llm_service import LLMConfigurationError, LLMServiceError
+from app.services.llm_service import (
+    LLMAuthenticationError,
+    LLMConfigurationError,
+    LLMServiceError,
+    redact_secrets,
+)
 from app.services.website_extractor import WebsiteExtractionError
+from app.utils.rate_limiter import enforce_rate_limit
 from app.utils.validators import SSRFProtectionError, URLValidationError
 
 settings = get_settings()
@@ -23,6 +29,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
+    debug=False,
     description=(
         "Production-minded AI-Powered Website Link Analysis API. "
         "Extracts factual website content with SSRF protection and generates a structured "
@@ -34,12 +41,18 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+allowed_origins = [
+    origin.strip()
+    for origin in settings.cors_origins.split(",")
+    if origin.strip()
+] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
 )
 
 
@@ -70,8 +83,11 @@ async def health_check(
         "status": "healthy",
         "version": current_settings.app_version,
         "configured_primary_provider": current_settings.llm_provider,
+        "configured_gemini_model": current_settings.gemini_model,
+        "configured_openai_model": current_settings.openai_model,
         "gemini_key_configured": current_settings.has_valid_gemini_key(),
         "openai_key_configured": current_settings.has_valid_openai_key(),
+        "demo_mode_enabled": current_settings.enable_demo_mode_without_api_key,
     }
 
 
@@ -80,11 +96,14 @@ async def health_check(
     response_model=LinkAnalysisResponse,
     status_code=status.HTTP_200_OK,
     tags=["Link Analysis"],
+    dependencies=[Depends(enforce_rate_limit)],
     summary="Analyze a website URL and generate 5 strategic AI marketing & SEO sections",
     responses={
         400: {"description": "Invalid URL format or SSRF policy violation"},
+        401: {"description": "Invalid or unauthorized LLM API key"},
         413: {"description": "Target website response exceeds maximum size limit"},
         422: {"description": "Validation error or unprocessable website content"},
+        429: {"description": "Rate limit exceeded"},
         502: {"description": "Upstream website unreachable or LLM generation failure"},
         503: {"description": "Missing LLM API credentials configuration"},
         504: {"description": "Upstream website fetch timed out"},
@@ -125,21 +144,33 @@ async def analyze_link(
             },
         ) from exc
     except LLMConfigurationError as exc:
-        logger.error("LLM configuration error: %s", exc)
+        safe_msg = redact_secrets(str(exc))
+        logger.error("LLM configuration error: %s", safe_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "error": "missing_api_key",
-                "message": str(exc),
+                "message": safe_msg,
+            },
+        ) from exc
+    except LLMAuthenticationError as exc:
+        safe_msg = redact_secrets(str(exc))
+        logger.error("LLM authentication error: %s", safe_msg)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "invalid_api_key",
+                "message": safe_msg,
             },
         ) from exc
     except LLMServiceError as exc:
-        logger.error("LLM generation error for '%s': %s", payload.url, exc)
+        safe_msg = redact_secrets(str(exc))
+        logger.error("LLM generation error for '%s': %s", payload.url, safe_msg)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
                 "error": "llm_generation_failed",
-                "message": str(exc),
+                "message": safe_msg,
             },
         ) from exc
 

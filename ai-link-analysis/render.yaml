@@ -8,6 +8,8 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
+      - key: APP_ENV
+        value: production
       - key: LLM_PROVIDER
         value: gemini
       - key: GEMINI_MODEL
@@ -16,8 +18,11 @@ services:
         value: gpt-4o-mini
       - key: ENABLE_LLM_FALLBACK
         value: "true"
+      - key: ENABLE_DEMO_MODE_WITHOUT_API_KEY
+        value: "false"
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "20"
       - key: GEMINI_API_KEY
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-

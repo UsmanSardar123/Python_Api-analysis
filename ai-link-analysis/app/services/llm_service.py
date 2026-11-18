@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -12,9 +13,33 @@ from app.schemas import LLMAnalysisPayload, WebsiteExtractedData
 
 logger = logging.getLogger(__name__)
 
+# Patterns used to sanitize error messages so API keys or Bearer tokens are never leaked
+_SECRET_REDACTION_PATTERNS = (
+    re.compile(r"(AIza[0-9A-Za-z\-_]{20,})"),
+    re.compile(r"(sk-[0-9A-Za-z\-_]{15,})"),
+    re.compile(r"(?i)(key=)([^&\s\"']+)"),
+    re.compile(r"(?i)(bearer\s+)([0-9A-Za-z\-_\.]+)"),
+)
+
+
+def redact_secrets(message: str) -> str:
+    """Redact any potential API keys, query keys, or bearer tokens from error strings or logs."""
+    if not message:
+        return ""
+    sanitized = str(message)
+    sanitized = _SECRET_REDACTION_PATTERNS[0].sub("[REDACTED_GEMINI_KEY]", sanitized)
+    sanitized = _SECRET_REDACTION_PATTERNS[1].sub("[REDACTED_OPENAI_KEY]", sanitized)
+    sanitized = _SECRET_REDACTION_PATTERNS[2].sub(r"\1[REDACTED]", sanitized)
+    sanitized = _SECRET_REDACTION_PATTERNS[3].sub(r"\1[REDACTED]", sanitized)
+    return sanitized
+
 
 class LLMConfigurationError(Exception):
     """Raised when required LLM API keys are missing or invalidly configured."""
+
+
+class LLMAuthenticationError(Exception):
+    """Raised when the configured LLM API key is rejected by the provider (401/403/API_KEY_INVALID)."""
 
 
 class LLMServiceError(Exception):
@@ -147,6 +172,7 @@ class LLMService:
         candidates = self._resolve_provider_order()
         user_prompt = build_user_prompt(extracted, competitor_hints)
         errors: list[str] = []
+        auth_errors: list[str] = []
 
         for provider, model, api_key in candidates:
             try:
@@ -175,9 +201,20 @@ class LLMService:
 
             except LLMConfigurationError:
                 raise
+            except LLMAuthenticationError as exc:
+                safe_msg = redact_secrets(str(exc))
+                logger.warning("LLM provider '%s' (%s) authentication failed: %s", provider, model, safe_msg)
+                auth_errors.append(f"{provider}/{model}: {safe_msg}")
+                errors.append(f"{provider}/{model}: {safe_msg}")
             except Exception as exc:
-                logger.warning("LLM provider '%s' (%s) failed: %s", provider, model, exc)
-                errors.append(f"{provider}/{model}: {exc}")
+                safe_msg = redact_secrets(str(exc))
+                logger.warning("LLM provider '%s' (%s) failed: %s", provider, model, safe_msg)
+                errors.append(f"{provider}/{model}: {safe_msg}")
+
+        if auth_errors and len(auth_errors) == len(candidates):
+            raise LLMAuthenticationError(
+                "Invalid or unauthorized LLM API key(s). Details: " + " | ".join(auth_errors)
+            )
 
         raise LLMServiceError(
             "Failed to generate valid structured analysis from LLM provider(s). Details: "
@@ -221,6 +258,7 @@ class LLMService:
     ) -> str:
         """Invoke Google Gemini API using google-genai SDK with structured JSON output."""
         try:
+            import asyncio
             import httpx
             from google import genai
             from google.genai import types
@@ -229,30 +267,74 @@ class LLMService:
                 f"google-genai package is not installed: {exc}"
             ) from exc
 
-        try:
-            http_options = types.HttpOptions(
-                async_client_args={"trust_env": False},
-                client_args={"trust_env": False},
-            )
-            client = genai.Client(api_key=api_key, http_options=http_options)
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_mime_type="application/json",
-                    response_schema=LLMAnalysisPayload,
-                    temperature=0.2,
-                ),
-            )
-            text = getattr(response, "text", None)
-            if not text:
-                raise LLMServiceError("Gemini returned an empty response body.")
-            return text
-        except LLMServiceError:
-            raise
-        except Exception as exc:
-            raise LLMServiceError(f"Google Gemini API call failed: {exc}") from exc
+        max_attempts = max(1, self.settings.llm_max_retries + 1)
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                http_options = types.HttpOptions(
+                    async_client_args={
+                        "trust_env": False,
+                        "timeout": self.settings.llm_timeout_seconds,
+                    },
+                    client_args={
+                        "trust_env": False,
+                        "timeout": self.settings.llm_timeout_seconds,
+                    },
+                )
+                client = genai.Client(api_key=api_key, http_options=http_options)
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model,
+                        contents=user_prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            response_mime_type="application/json",
+                            response_schema=LLMAnalysisPayload,
+                            temperature=0.2,
+                        ),
+                    ),
+                    timeout=self.settings.llm_timeout_seconds,
+                )
+                text = getattr(response, "text", None)
+                if not text:
+                    raise LLMServiceError("Gemini returned an empty response body.")
+                return text
+            except (LLMServiceError, LLMAuthenticationError):
+                raise
+            except Exception as exc:
+                last_error = exc
+                safe_err = redact_secrets(str(exc))
+                lower_err = safe_err.lower()
+                if any(
+                    token in lower_err
+                    for token in (
+                        "api_key_invalid",
+                        "api key not valid",
+                        "invalid api key",
+                        "permission_denied",
+                        "unauthenticated",
+                        "401",
+                        "403",
+                    )
+                ):
+                    raise LLMAuthenticationError(
+                        f"Google Gemini API authentication failed (invalid or unauthorized API key): {safe_err}"
+                    ) from exc
+
+                is_transient = any(
+                    token in lower_err
+                    for token in ("429", "resource_exhausted", "rate limit", "503", "unavailable", "timeout", "timed out")
+                )
+                if is_transient and attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+
+                raise LLMServiceError(f"Google Gemini API call failed: {safe_err}") from exc
+
+        raise LLMServiceError(
+            f"Google Gemini API call failed after {max_attempts} attempts: {redact_secrets(str(last_error))}"
+        )
 
     async def _call_openai(
         self,
@@ -283,10 +365,25 @@ class LLMService:
                 if not response.choices or not response.choices[0].message.content:
                     raise LLMServiceError("OpenAI returned an empty completion choice.")
                 return response.choices[0].message.content
-        except LLMServiceError:
+        except (LLMServiceError, LLMAuthenticationError):
             raise
         except Exception as exc:
-            raise LLMServiceError(f"OpenAI API call failed: {exc}") from exc
+            safe_err = redact_secrets(str(exc))
+            lower_err = safe_err.lower()
+            if any(
+                token in lower_err
+                for token in (
+                    "invalid_api_key",
+                    "incorrect api key",
+                    "authenticationerror",
+                    "401",
+                    "403",
+                )
+            ):
+                raise LLMAuthenticationError(
+                    f"OpenAI API authentication failed (invalid or unauthorized API key): {safe_err}"
+                ) from exc
+            raise LLMServiceError(f"OpenAI API call failed: {safe_err}") from exc
 
     def _build_deterministic_demo_analysis(
         self,
