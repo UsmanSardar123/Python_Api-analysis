@@ -2,6 +2,9 @@
 
 Production-minded **FastAPI** backend application that extracts factual content from public websites with **SSRF protection** and generates a structured **5-part AI marketing, SEO, and competitor analysis** using **Google Gemini** (`gemini-2.5-flash`) and **OpenAI** (`gpt-4o-mini` fallback).
 
+## Repository
+
+- **GitHub Repository**: https://github.com/UsmanSardar123/Python_Api-analysis
 - **Full Documentation**: [`ai-link-analysis/README.md`](./ai-link-analysis/README.md)
 - **Final Verification Report**: [`FINAL_VERIFICATION_REPORT.md`](./FINAL_VERIFICATION_REPORT.md)
 - **Render Blueprint**: [`render.yaml`](./render.yaml)

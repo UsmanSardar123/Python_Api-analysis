@@ -144,3 +144,4 @@ if __name__ == "__main__":
     if args.base_url:
         raise SystemExit(verify_remote_endpoint(args.base_url))
     raise SystemExit(asyncio.run(verify_direct_service()))
+
